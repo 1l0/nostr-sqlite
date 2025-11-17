@@ -8,18 +8,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"strconv"
 	"strings"
 	"sync/atomic"
 
-	_ "github.com/mattn/go-sqlite3"
-	"github.com/nbd-wtf/go-nostr"
+	"fiatjaf.com/nostr"
 )
 
 var (
-	ErrInvalidAddressable     = errors.New("addressable event must have exactly one (non empty) 'd' tag")
-	ErrInvalidReplacement     = errors.New("called Replace on a non-replaceable event")
-	ErrInvalidDeletionRequest = errors.New("deletion request must be kind 5")
+	ErrInvalidAddressableEvent = errors.New("addressable event doesn't have a 'd' tag")
+	ErrInvalidReplacement      = errors.New("called Replace on a non-replaceable event")
+	ErrInternalQuery           = errors.New("internal query error")
 )
 
 //go:embed schema.sql
@@ -33,20 +31,20 @@ var schema string
 // architecture of SQLite, there can only be one writer at the time.
 //
 // This limitation remains even after applying the recommended concurrency optimisations,
-// such as journal_mode=WAL and PRAGMA busy_timeout=5s, which are applied by default in this implementation.
+// such as journal_mode=WAL and PRAGMA busy_timeout=1s, which are applied by default in this implementation.
 //
 // Therefore it remains possible that methods return the error [sqlite3.ErrBusy].
 // To reduce the likelihood of this happening, you can:
-//   - increase the busy_timeout with the option [WithBusyTimeout] (default is 5s).
+//   - increase the busy_timeout with the option [WithBusyTimeout] (default is 1s).
 //   - provide synchronisation, for example with a mutex or channel(s). This however won't
 //     help if there are other programs writing to the same sqlite file.
 //
 // If instead you want to handle all [sqlite3.ErrBusy] in your application,
-// use WithBusyTimeout(0) to make blocked writers return immediately.
+// use WithBusyTimeout(0) to make blocked writers return immediatly.
 //
 // More about WAL mode and concurrency: https://sqlite.org/wal.html
 type Store struct {
-	DB *sql.DB
+	*sql.DB
 
 	optimizeEvery int32        // the threshold of writes that trigger PRAGMA optimize
 	writeCount    atomic.Int32 // successful writes since last PRAGMA optimize
@@ -60,32 +58,24 @@ type Store struct {
 
 // New returns an sqlite3 store connected to the sqlite file located at the provided
 // file path, after applying the base schema, and the provided options.
-func New(path string, opts ...Option) (*Store, error) {
-	db, err := sql.Open("sqlite3", path)
-	if err != nil {
-		return nil, fmt.Errorf("failed to connect to sqlite3 at %s: %w", path, err)
-	}
+func New(db *sql.DB, opts ...Option) (*Store, error) {
 	if _, err := db.Exec(schema); err != nil {
 		return nil, fmt.Errorf("failed to apply base schema: %w", err)
 	}
+
 	if _, err := db.Exec("PRAGMA journal_mode = WAL;"); err != nil {
 		return nil, fmt.Errorf("failed to set WAL mode: %w", err)
 	}
-	if _, err := db.Exec("PRAGMA busy_timeout = 5000;"); err != nil {
+
+	if _, err := db.Exec("PRAGMA busy_timeout = 1000;"); err != nil {
 		return nil, fmt.Errorf("failed to set busy timeout: %w", err)
-	}
-	if _, err := db.Exec("PRAGMA foreign_keys = ON;"); err != nil {
-		return nil, fmt.Errorf("failed to activate foreign keys: %w", err)
-	}
-	if _, err := db.Exec("PRAGMA cache_size = -64000"); err != nil {
-		return nil, fmt.Errorf("failed to set default cache size: %w", err)
 	}
 
 	store := &Store{
 		DB:            db,
 		optimizeEvery: 5000,
-		filterPolicy:  DefaultFilterPolicy,
-		eventPolicy:   DefaultEventPolicy,
+		filterPolicy:  defaultFilterPolicy,
+		eventPolicy:   defaultEventPolicy,
 		queryBuilder:  DefaultQueryBuilder,
 		countBuilder:  DefaultCountBuilder,
 	}
@@ -169,7 +159,7 @@ func (s *Store) Save(ctx context.Context, e *nostr.Event) (bool, error) {
 	}
 
 	res, err := s.DB.ExecContext(ctx, `INSERT OR IGNORE INTO events (id, pubkey, created_at, kind, tags, content, sig)
-        VALUES ($1, $2, $3, $4, $5, $6, $7)`, e.ID, e.PubKey, e.CreatedAt, e.Kind, tags, e.Content, e.Sig)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)`, e.ID.Hex(), e.PubKey.Hex(), e.CreatedAt, int(e.Kind.Num()), tags, e.Content, string(e.Sig[:]))
 
 	if err != nil {
 		return false, fmt.Errorf("failed to execute: %w", err)
@@ -188,7 +178,8 @@ func (s *Store) Save(ctx context.Context, e *nostr.Event) (bool, error) {
 }
 
 // Delete the event with the provided id. If the event is not found, nothing happens and nil is returned.
-// Delete returns true if the event was deleted, false in case of errors or if the event was not found.
+// Delete returns true if the event was deleted, false in case of errors or if the event
+// was never present.
 func (s *Store) Delete(ctx context.Context, id string) (bool, error) {
 	res, err := s.DB.ExecContext(ctx, "DELETE FROM events WHERE id = $1", id)
 	if err != nil {
@@ -205,103 +196,6 @@ func (s *Store) Delete(ctx context.Context, id string) (bool, error) {
 		return true, nil
 	}
 	return false, nil
-}
-
-// DeleteRequest processes a NIP-09 deletion request (kind 5 event), deleting all referenced events
-// that share the same pubkey as the deletion request. It returns the number of events deleted.
-//
-// The event is assumed to have been validated before calling this function.
-// Calling DeleteRequest with a non kind-5 event returns [ErrInvalidDeletionRequest].
-// Malformed tags are silently skipped.
-//
-// More info: https://github.com/nostr-protocol/nips/blob/master/09.md
-func (s *Store) DeleteRequest(ctx context.Context, event *nostr.Event) (int, error) {
-	if event.Kind != nostr.KindDeletion {
-		return 0, ErrInvalidDeletionRequest
-	}
-
-	eIDs := findAll(event.Tags, "e")
-	aTags := findAll(event.Tags, "a")
-
-	if len(eIDs) == 0 && len(aTags) == 0 {
-		return 0, nil
-	}
-
-	tx, err := s.DB.BeginTx(ctx, nil)
-	if err != nil {
-		return 0, fmt.Errorf("failed to begin transaction: %w", err)
-	}
-	defer tx.Rollback()
-
-	var deleted int
-
-	// e tags: single batched DELETE with an IN clause, enforcing pubkey match.
-	if len(eIDs) > 0 {
-		query := "DELETE FROM events WHERE pubkey = ? AND id " + in(eIDs)
-		args := make([]any, 0, 1+len(eIDs))
-		args = append(args, event.PubKey)
-		for _, id := range eIDs {
-			args = append(args, id)
-		}
-
-		res, err := tx.ExecContext(ctx, query, args...)
-		if err != nil {
-			return 0, fmt.Errorf("failed to delete by e tags: %w", err)
-		}
-		rows, err := res.RowsAffected()
-		if err != nil {
-			return 0, fmt.Errorf("failed to check rows affected: %w", err)
-		}
-		deleted += int(rows)
-	}
-
-	// a tags: one DELETE per tag, since each has a distinct kind/pubkey/d combination.
-	// Deletes all versions of the addressable event up to the deletion request's created_at.
-	for _, a := range aTags {
-		parts := strings.SplitN(a, ":", 3)
-		if len(parts) != 3 {
-			continue
-		}
-
-		kind, err := strconv.Atoi(parts[0])
-		if err != nil {
-			continue
-		}
-
-		pubkey := parts[1]
-		if pubkey != event.PubKey {
-			continue
-		}
-
-		d := parts[2]
-		if d == "" {
-			continue
-		}
-
-		query := `DELETE FROM events
-			WHERE kind = ? AND pubkey = ? AND created_at <= ?
-			AND id IN (SELECT event_id FROM tags WHERE key = 'd' AND value = ?)`
-		args := []any{kind, pubkey, int64(event.CreatedAt), d}
-
-		res, err := tx.ExecContext(ctx, query, args...)
-		if err != nil {
-			return 0, fmt.Errorf("failed to delete by a tag %q: %w", a, err)
-		}
-		rows, err := res.RowsAffected()
-		if err != nil {
-			return 0, fmt.Errorf("failed to check rows affected: %w", err)
-		}
-		deleted += int(rows)
-	}
-
-	if err := tx.Commit(); err != nil {
-		return 0, fmt.Errorf("failed to commit transaction: %w", err)
-	}
-
-	if deleted > 0 {
-		s.checkOptimize(ctx)
-	}
-	return deleted, nil
 }
 
 // Replace an old event with the new one according to NIP-01.
@@ -321,60 +215,41 @@ func (s *Store) Replace(ctx context.Context, event *nostr.Event) (bool, error) {
 		return false, err
 	}
 
-	var query string
-	var args []any
-
+	var query Query
 	switch {
-	case nostr.IsReplaceableKind(event.Kind):
-		query = "SELECT id, created_at FROM events WHERE kind = $1 AND pubkey = $2"
-		args = []any{event.Kind, event.PubKey}
-
-	case nostr.IsAddressableKind(event.Kind):
-		dTags := findAll(event.Tags, "d")
-		if len(dTags) != 1 {
-			return false, ErrInvalidAddressable
+	case event.Kind.IsReplaceable():
+		query = Query{
+			SQL:  "SELECT id, created_at FROM events WHERE kind = $1 AND pubkey = $2",
+			Args: []any{int(event.Kind.Num()), event.PubKey.Hex()},
 		}
 
-		d := dTags[0]
-		if d == "" {
-			return false, ErrInvalidAddressable
+	case event.Kind.IsAddressable():
+		dTag := event.Tags.GetD()
+		if dTag == "" {
+			return false, ErrInvalidAddressableEvent
 		}
 
-		query = `SELECT e.id, e.created_at FROM events AS e
-				JOIN tags AS t ON e.id = t.event_id
-				WHERE e.kind = ? AND e.pubkey = ? AND t.key = 'd' AND t.value = ?`
-		args = []any{event.Kind, event.PubKey, d}
+		query = Query{
+			SQL: `SELECT e.id, e.created_at FROM events AS e 
+				JOIN tags AS t ON e.id = t.event_id 
+				WHERE e.kind = $1 AND e.pubkey = $2 AND t.key = 'd' AND t.value = $3;`,
+			Args: []any{int(event.Kind.Num()), event.PubKey.Hex(), dTag},
+		}
 
 	default:
 		return false, ErrInvalidReplacement
 	}
 
-	replaced, err := s.replace(ctx, event, query, args)
+	replaced, err := s.replace(ctx, event, query)
 	if err != nil {
 		return false, fmt.Errorf("failed to replace: %w", err)
 	}
 	return replaced, nil
 }
 
-// findAll returns all values of the given key in the tags.
-func findAll(tags nostr.Tags, key string) []string {
-	var values []string
-	for _, t := range tags {
-		if len(t) >= 2 && t[0] == key {
-			values = append(values, t[1])
-		}
-	}
-	return values
-}
-
 // replace the event with the provided id with the new event.
 // It's an atomic version of Save(ctx, new) + Delete(ctx, id)
-func (s *Store) replace(
-	ctx context.Context,
-	event *nostr.Event,
-	query string,
-	args []any) (bool, error) {
-
+func (s *Store) replace(ctx context.Context, event *nostr.Event, query Query) (bool, error) {
 	tags, err := json.Marshal(event.Tags)
 	if err != nil {
 		return false, fmt.Errorf("failed to marshal the event tags: %w", err)
@@ -389,13 +264,13 @@ func (s *Store) replace(
 	var oldID string
 	var oldCreatedAt nostr.Timestamp
 
-	row := tx.QueryRowContext(ctx, query, args...)
+	row := tx.QueryRowContext(ctx, query.SQL, query.Args...)
 	err = row.Scan(&oldID, &oldCreatedAt)
 
 	if errors.Is(err, sql.ErrNoRows) {
 		// no old event found, insert the new one
 		_, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO events (id, pubkey, created_at, kind, tags, content, sig)
-        VALUES ($1, $2, $3, $4, $5, $6, $7)`, event.ID, event.PubKey, event.CreatedAt, event.Kind, tags, event.Content, event.Sig)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)`, event.ID.Hex(), event.PubKey.Hex(), event.CreatedAt, int(event.Kind.Num()), tags, event.Content, string(event.Sig[:]))
 
 		if err != nil {
 			return false, err
@@ -419,7 +294,7 @@ func (s *Store) replace(
 	}
 
 	if _, err = tx.ExecContext(ctx, `INSERT OR IGNORE INTO events (id, pubkey, created_at, kind, tags, content, sig)
-	VALUES ($1, $2, $3, $4, $5, $6, $7)`, event.ID, event.PubKey, event.CreatedAt, event.Kind, tags, event.Content, event.Sig); err != nil {
+	VALUES ($1, $2, $3, $4, $5, $6, $7)`, event.ID.Hex(), event.PubKey.Hex(), event.CreatedAt, int(event.Kind.Num()), tags, event.Content, string(event.Sig[:])); err != nil {
 		return false, err
 	}
 
@@ -450,32 +325,53 @@ func (s *Store) QueryWithBuilder(ctx context.Context, build QueryBuilder, filter
 		return nil, fmt.Errorf("failed to build query: %w", err)
 	}
 
-	size := totalLimit(filters)
-	events := make([]nostr.Event, 0, size)
-
-	for _, q := range queries {
-		rows, err := s.DB.QueryContext(ctx, q.SQL, q.Args...)
+	var events []nostr.Event
+	for i, query := range queries {
+		rows, err := s.DB.QueryContext(ctx, query.SQL, query.Args...)
 		if errors.Is(err, sql.ErrNoRows) {
 			continue
 		}
 		if err != nil {
-			return events, fmt.Errorf("failed to fetch events with query %s: %w", q, err)
+			return nil, fmt.Errorf("failed to fetch events with query %s: %w", queries[i], err)
 		}
+		defer rows.Close()
 
 		for rows.Next() {
-			var e nostr.Event
-			if err = rows.Scan(&e.ID, &e.PubKey, &e.CreatedAt, &e.Kind, &e.Tags, &e.Content, &e.Sig); err != nil {
-				rows.Close()
-				return events, fmt.Errorf("failed to scan event row: %w", err)
+			rawEvent := struct {
+				ID        string
+				PubKey    string
+				CreatedAt nostr.Timestamp
+				Kind      uint16
+				Tags      []byte
+				Content   string
+				Sig       string
+			}{}
+			err = rows.Scan(&rawEvent.ID, &rawEvent.PubKey, &rawEvent.CreatedAt, &rawEvent.Kind, &rawEvent.Tags, &rawEvent.Content, &rawEvent.Sig)
+			if err != nil {
+				return events, fmt.Errorf("%w: failed to scan event row: %w", ErrInternalQuery, err)
 			}
-			events = append(events, e)
+
+			tags := nostr.Tags{}
+			if err := json.Unmarshal(rawEvent.Tags, &tags); err != nil {
+				return events, fmt.Errorf("%w: failed to scan event row: %w", ErrInternalQuery, err)
+			}
+			var sig [64]byte
+			copy(sig[:], rawEvent.Sig)
+
+			events = append(events, nostr.Event{
+				ID:        nostr.MustIDFromHex(rawEvent.ID),
+				PubKey:    nostr.MustPubKeyFromHex(rawEvent.PubKey),
+				CreatedAt: rawEvent.CreatedAt,
+				Kind:      nostr.Kind(rawEvent.Kind),
+				Tags:      tags,
+				Content:   rawEvent.Content,
+				Sig:       sig,
+			})
 		}
 
 		if err := rows.Err(); err != nil {
-			rows.Close()
-			return events, fmt.Errorf("failed to scan event rows: %w", err)
+			return events, fmt.Errorf("%w: failed to scan event row: %w", ErrInternalQuery, err)
 		}
-		rows.Close()
 	}
 	return events, nil
 }
@@ -507,121 +403,162 @@ func (s *Store) CountWithBuilder(ctx context.Context, build QueryBuilder, filter
 }
 
 func DefaultQueryBuilder(filters ...nostr.Filter) ([]Query, error) {
-	if len(filters) == 0 {
+	switch len(filters) {
+	case 0:
 		return nil, nil
-	}
 
-	queries := make([]Query, 0, len(filters))
-	for _, filter := range filters {
-		conds, args := toSQL(filter)
-		query := "SELECT e.* FROM events AS e"
-		if len(conds) > 0 {
-			query += " WHERE " + strings.Join(conds, " AND ")
-		}
+	case 1:
+		query, args := buildQuery(filters[0])
 		query += " ORDER BY e.created_at DESC, e.id ASC LIMIT ?"
+		args = append(args, filters[0].Limit)
+		return []Query{{SQL: query, Args: args}}, nil
 
-		args = append(args, filter.Limit)
-		queries = append(queries, Query{SQL: query, Args: args})
+	default:
+		subQueries := make([]string, 0, len(filters))
+		allArgs := make([]any, 0, len(filters))
+		limit := 0
+
+		for _, filter := range filters {
+			query, args := buildQuery(filter)
+			subQueries = append(subQueries, query)
+			allArgs = append(allArgs, args...)
+			limit += filter.Limit
+		}
+
+		query := "SELECT * FROM (" + strings.Join(subQueries, " UNION ALL ") + ")" +
+			" GROUP BY id ORDER BY created_at DESC, id ASC LIMIT ?"
+		allArgs = append(allArgs, limit)
+		return []Query{{SQL: query, Args: allArgs}}, nil
 	}
-	return queries, nil
 }
 
 func DefaultCountBuilder(filters ...nostr.Filter) ([]Query, error) {
-	if len(filters) == 0 {
+	switch len(filters) {
+	case 0:
 		return nil, nil
-	}
 
-	groups := make([]string, 0, len(filters))
-	allArgs := make([]any, 0)
+	case 1:
+		query, args := buildCount(filters[0])
+		return []Query{{SQL: query, Args: args}}, nil
 
-	for _, filter := range filters {
-		conds, args := toSQL(filter)
-		if len(conds) == 0 {
-			// this filter matches all events, so the OR is universally true.
-			// Return all the events in the database.
-			return []Query{{SQL: "SELECT COUNT(*) FROM events AS e", Args: nil}}, nil
+	default:
+		subQueries := make([]string, 0, len(filters))
+		allArgs := make([]any, 0, len(filters))
+
+		for _, filter := range filters {
+			query, args := buildCount(filter)
+			subQueries = append(subQueries, "("+query+")")
+			allArgs = append(allArgs, args...)
 		}
 
-		groups = append(groups, "("+strings.Join(conds, " AND ")+")")
-		allArgs = append(allArgs, args...)
+		// TODO: we are summing all counts together, without any deduplication
+		query := "SELECT (" + strings.Join(subQueries, " + ") + ")"
+		return []Query{{SQL: query, Args: allArgs}}, nil
 	}
-
-	query := "SELECT COUNT(*) FROM events AS e WHERE " + strings.Join(groups, " OR ")
-	return []Query{{SQL: query, Args: allArgs}}, nil
 }
 
-// toSQL converts a nostr.Filter to a list of SQL conditions and arguments.
-func toSQL(filter nostr.Filter) (conds []string, args []any) {
+func buildQuery(filter nostr.Filter) (string, []any) {
+	sql := toSql(filter)
+	if sql.JoinTags {
+		query := "SELECT e.* FROM events AS e JOIN tags AS t ON t.event_id = e.id" +
+			" WHERE " + strings.Join(sql.Conditions, " AND ") + " GROUP BY e.id"
+		return query, sql.Args
+	}
+
+	query := "SELECT e.* FROM events AS e"
+	if len(sql.Conditions) > 0 {
+		query += " WHERE " + strings.Join(sql.Conditions, " AND ")
+	}
+	return query, sql.Args
+}
+
+func buildCount(filter nostr.Filter) (string, []any) {
+	sql := toSql(filter)
+	if sql.JoinTags {
+		query := "SELECT COUNT(DISTINCT e.id) FROM events AS e JOIN tags AS t ON t.event_id = e.id" +
+			" WHERE " + strings.Join(sql.Conditions, " AND ")
+		return query, sql.Args
+	}
+
+	query := "SELECT COUNT(e.id) FROM events AS e"
+	if len(sql.Conditions) > 0 {
+		query += " WHERE " + strings.Join(sql.Conditions, " AND ")
+	}
+	return query, sql.Args
+}
+
+type sqlFilter struct {
+	Conditions []string
+	Args       []any
+	JoinTags   bool
+}
+
+func toSql(filter nostr.Filter) sqlFilter {
+	s := sqlFilter{}
 	if len(filter.IDs) > 0 {
-		conds = append(conds, "e.id "+in(filter.IDs))
+		s.Conditions = append(s.Conditions, "e.id"+equalityClause(filter.IDs))
 		for _, id := range filter.IDs {
-			args = append(args, id)
+			s.Args = append(s.Args, id.Hex())
 		}
 	}
 
 	if len(filter.Kinds) > 0 {
-		conds = append(conds, "e.kind "+in(filter.Kinds))
+		s.Conditions = append(s.Conditions, "e.kind"+equalityClause(filter.Kinds))
 		for _, kind := range filter.Kinds {
-			args = append(args, kind)
+			s.Args = append(s.Args, int(kind.Num()))
 		}
 	}
 
 	if len(filter.Authors) > 0 {
-		conds = append(conds, "e.pubkey "+in(filter.Authors))
+		s.Conditions = append(s.Conditions, "e.pubkey"+equalityClause(filter.Authors))
 		for _, pk := range filter.Authors {
-			args = append(args, pk)
+			s.Args = append(s.Args, pk.Hex())
 		}
 	}
 
-	if filter.Until != nil {
-		conds = append(conds, "e.created_at <= ?")
-		args = append(args, int64(*filter.Until))
+	if filter.Until != 0 {
+		s.Conditions = append(s.Conditions, "e.created_at <= ?")
+		s.Args = append(s.Args, filter.Until.Time().Unix())
 	}
 
-	if filter.Since != nil {
-		conds = append(conds, "e.created_at >= ?")
-		args = append(args, int64(*filter.Since))
+	if filter.Since != 0 {
+		s.Conditions = append(s.Conditions, "e.created_at >= ?")
+		s.Args = append(s.Args, filter.Since.Time().Unix())
 	}
 
 	if len(filter.Tags) > 0 {
-		// Each tag key must match (AND logic between different keys)
-		// Within a tag key, any value can match (OR logic via IN clause)
+		conds := make([]string, 0, len(filter.Tags))
+		args := make([]any, 0, len(filter.Tags))
+
 		for key, vals := range filter.Tags {
-			if len(vals) == 0 || key == "" {
+			if len(vals) == 0 {
 				continue
 			}
 
-			conds = append(conds, "e.id IN (SELECT event_id FROM tags WHERE key = ? AND value "+in(vals)+")")
+			conds = append(conds, "(t.key = ? AND t.value"+equalityClause(vals)+")")
 			args = append(args, key)
 			for _, v := range vals {
 				args = append(args, v)
 			}
 		}
+
+		if len(conds) > 0 {
+			s.JoinTags = true
+			s.Conditions = append(s.Conditions, strings.Join(conds, " OR "))
+			s.Args = append(s.Args, args...)
+		}
 	}
-	return conds, args
+	return s
 }
 
-// totalLimit returns the sum of all limits across all filters.
-func totalLimit(filters nostr.Filters) int {
-	if len(filters) == 0 {
-		return 0
-	}
-
-	limit := 0
-	for _, f := range filters {
-		limit += f.Limit
-	}
-	return limit
-}
-
-// in returns the appropriate SQL comparison operator and placeholder(s)
+// equalityClause returns the appropriate SQL comparison operator and placeholder(s)
 // for use in a WHERE clause, based on the number of values provided.
 // If the slice contains one value, it returns " = ?".
 // If it contains multiple values, it returns " IN (?, ?, ... )" with the correct number of placeholders.
-// It panics if vals is nil or empty.
-func in[T any](vals []T) string {
+// It panics is vals is nil or empty.
+func equalityClause[T any](vals []T) string {
 	if len(vals) == 1 {
-		return "= ?"
+		return " = ?"
 	}
-	return "IN (?" + strings.Repeat(",?", len(vals)-1) + ")"
+	return " IN (?" + strings.Repeat(",?", len(vals)-1) + ")"
 }
