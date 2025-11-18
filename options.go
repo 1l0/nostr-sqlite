@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/nbd-wtf/go-nostr"
+	"fiatjaf.com/nostr"
 )
 
 type Option func(*Store) error
@@ -37,34 +37,6 @@ func WithBusyTimeout(d time.Duration) Option {
 	}
 }
 
-// ByteSize is a typed integer representing a number of bytes.
-// Use the KiB and MiB constants (or multiples thereof) to express
-// values in a readable way, e.g. 32 * sqlite.MiB.
-type ByteSize int64
-
-const (
-	KiB ByteSize = 1024
-	MiB ByteSize = 1024 * KiB
-)
-
-// WithCacheSize sets the SQLite PRAGMA cache_size.
-// The value is converted to kibibytes and passed as a negative integer,
-// which is the portable, page-size-independent form accepted by SQLite.
-// The minimum accepted value is 1 KiB.
-func WithCacheSize(size ByteSize) Option {
-	return func(s *Store) error {
-		if size < KiB {
-			return fmt.Errorf("cache size must be at least 1 KiB, got %d bytes", int64(size))
-		}
-		kib := size / KiB
-		cmd := fmt.Sprintf("PRAGMA cache_size = %d", -kib)
-		if _, err := s.DB.Exec(cmd); err != nil {
-			return fmt.Errorf("failed to set cache size: %w", err)
-		}
-		return nil
-	}
-}
-
 // WithOptimisationEvery sets how many writes trigger a PRAGMA optimize operation.
 func WithOptimisationEvery(n int) Option {
 	return func(s *Store) error {
@@ -72,23 +44,6 @@ func WithOptimisationEvery(n int) Option {
 			return errors.New("number of write before PRAGMA optimize must be non-negative")
 		}
 		s.optimizeEvery = int32(n)
-		return nil
-	}
-}
-
-// WithEventPolicy sets a custom [nastro.EventPolicy] on the Store.
-// It will be used to validate events before inserting them into the database.
-func WithEventPolicy(p EventPolicy) Option {
-	return func(s *Store) error {
-		s.eventPolicy = p
-		return nil
-	}
-}
-
-// WithoutEventPolicy removes any event policy from the store.
-func WithoutEventPolicy() Option {
-	return func(s *Store) error {
-		s.eventPolicy = NoEventPolicy
 		return nil
 	}
 }
@@ -102,10 +57,11 @@ func WithFilterPolicy(p FilterPolicy) Option {
 	}
 }
 
-// WithoutFilterPolicy removes any filter policy from the store.
-func WithoutFilterPolicy() Option {
+// WithEventPolicy sets a custom [nastro.EventPolicy] on the Store.
+// It will be used to validate events before inserting them into the database.
+func WithEventPolicy(p EventPolicy) Option {
 	return func(s *Store) error {
-		s.filterPolicy = NoFilterPolicy
+		s.eventPolicy = p
 		return nil
 	}
 }
@@ -129,11 +85,13 @@ func WithCountBuilder(b QueryBuilder) Option {
 // EventPolicy validates a nostr event before it's written to the store.
 type EventPolicy func(*nostr.Event) error
 
-var NoEventPolicy EventPolicy = func(e *nostr.Event) error { return nil } // no-op event policy
+// FilterPolicy sanitizes a list of filters before building a query.
+// It returns a potentially modified list and an error if the input is invalid.
+type FilterPolicy func(...nostr.Filter) ([]nostr.Filter, error)
 
 // DefaultEventPolicy returns an error if the event has too many tags, or if the
 // content is too big.
-func DefaultEventPolicy(e *nostr.Event) error {
+func defaultEventPolicy(e *nostr.Event) error {
 	if len(e.Tags) > 100_000 {
 		return fmt.Errorf("event has too many tags: %d", len(e.Tags))
 	}
@@ -143,12 +101,6 @@ func DefaultEventPolicy(e *nostr.Event) error {
 	return nil
 }
 
-// FilterPolicy sanitizes a list of filters before building a query.
-// It returns a potentially modified list and an error if the input is invalid.
-type FilterPolicy func(...nostr.Filter) (nostr.Filters, error)
-
-var NoFilterPolicy FilterPolicy = func(filters ...nostr.Filter) (nostr.Filters, error) { return filters, nil } // no-op filter policy
-
 // DefaultFilterPolicy enforces 4 rules:
 //  1. Filters must be less than 200.
 //  2. Filters can't have the "search" field, as NIP-50 is not supported by default.
@@ -156,7 +108,7 @@ var NoFilterPolicy FilterPolicy = func(filters ...nostr.Filter) (nostr.Filters, 
 //  4. Remaining filters must have a Limit > 0.
 //
 // It returns the cleaned list of filters or an error.
-func DefaultFilterPolicy(filters ...nostr.Filter) (nostr.Filters, error) {
+func defaultFilterPolicy(filters ...nostr.Filter) ([]nostr.Filter, error) {
 	if len(filters) > 200 {
 		return nil, fmt.Errorf("filters must be less than 200: %d", len(filters))
 	}
@@ -165,7 +117,7 @@ func DefaultFilterPolicy(filters ...nostr.Filter) (nostr.Filters, error) {
 		return nil, errors.New("NIP-50 search is not supported")
 	}
 
-	result := make(nostr.Filters, 0, len(filters))
+	result := make([]nostr.Filter, 0, len(filters))
 	for _, f := range filters {
 		if !f.LimitZero {
 			if f.Limit < 1 {
@@ -177,7 +129,7 @@ func DefaultFilterPolicy(filters ...nostr.Filter) (nostr.Filters, error) {
 	return result, nil
 }
 
-func containSearch(filters nostr.Filters) bool {
+func containSearch(filters []nostr.Filter) bool {
 	for _, f := range filters {
 		if f.Search != "" {
 			return true
