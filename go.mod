@@ -1,4 +1,4 @@
-module github.com/vertex-lab/nostr-sqlite
+module github.com/1l0/nostr-sqlite
 
 go 1.24.1
 
