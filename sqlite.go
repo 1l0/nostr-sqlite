@@ -59,6 +59,12 @@ type Store struct {
 // New returns an sqlite3 store connected to the sqlite file located at the provided
 // file path, after applying the base schema, and the provided options.
 func New(db *sql.DB, opts ...Option) (*Store, error) {
+	// SQLite performs best with a small connection pool. Since it can only have one writer
+	// at a time, allowing many concurrent connections increases lock contention and
+	// can cause "database is locked" errors under load.
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+
 	if _, err := db.Exec(schema); err != nil {
 		return nil, fmt.Errorf("failed to apply base schema: %w", err)
 	}
