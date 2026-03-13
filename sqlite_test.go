@@ -285,8 +285,25 @@ func TestDefaultQueryBuilder(t *testing.T) {
 				t.Fatalf("expected error nil, got %v", err)
 			}
 
-			if !reflect.DeepEqual(query[0], test.query) {
-				t.Fatalf("expected query:\n%v\ngot\n%v", test.query, query[0])
+			// Special handling for "single filter, tags" test due to non-deterministic map iteration
+			if test.name == "single filter, tags" {
+				// Both orders are valid, check if we got either one
+				expectedOrder1 := Query{
+					SQL:  "SELECT e.* FROM events AS e JOIN tags AS t ON t.event_id = e.id WHERE (t.key = ? AND t.value IN (?,?)) OR (t.key = ? AND t.value = ?) GROUP BY e.id ORDER BY e.created_at DESC, e.id ASC LIMIT ?",
+					Args: []any{"e", "0000000000000000000000000000000000000000000000000000000000000ccc", "0000000000000000000000000000000000000000000000000000000000000ddd", "p", "0000000000000000000000000000000000000000000000000000000000000fff", 11},
+				}
+				expectedOrder2 := Query{
+					SQL:  "SELECT e.* FROM events AS e JOIN tags AS t ON t.event_id = e.id WHERE (t.key = ? AND t.value = ?) OR (t.key = ? AND t.value IN (?,?)) GROUP BY e.id ORDER BY e.created_at DESC, e.id ASC LIMIT ?",
+					Args: []any{"p", "0000000000000000000000000000000000000000000000000000000000000fff", "e", "0000000000000000000000000000000000000000000000000000000000ccc", "0000000000000000000000000000000000000000000000000000000000000ddd", 11},
+				}
+
+				if !reflect.DeepEqual(query[0], expectedOrder1) && !reflect.DeepEqual(query[0], expectedOrder2) {
+					t.Fatalf("expected either order1:\n%v\nor order2:\n%v\ngot\n%v", expectedOrder1, expectedOrder2, query[0])
+				}
+			} else {
+				if !reflect.DeepEqual(query[0], test.query) {
+					t.Fatalf("expected query:\n%v\ngot\n%v", test.query, query[0])
+				}
 			}
 		})
 	}
