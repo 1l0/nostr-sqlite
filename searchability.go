@@ -116,6 +116,14 @@ func (s *Store) UpsertRelayInfo(ctx context.Context, relayURL string, fetchedAt 
 		}
 	}
 
+	var pubkeyStr, selfStr string
+	if info.PubKey != nil {
+		pubkeyStr = info.PubKey.String()
+	}
+	if info.Self != nil {
+		selfStr = info.Self.String()
+	}
+
 	_, err = s.DB.ExecContext(ctx, `
 INSERT INTO relays (
   url, fetched_at,
@@ -143,7 +151,7 @@ ON CONFLICT(url) DO UPDATE SET
   fees = excluded.fees
 WHERE excluded.fetched_at > relays.fetched_at
 `, canon, fetchedAt,
-		info.Name, info.Description, info.Banner, info.Icon, info.PubKey, info.Self, info.Contact, supportedNIPs, info.Software, info.Version,
+		info.Name, info.Description, info.Banner, info.Icon, pubkeyStr, selfStr, info.Contact, supportedNIPs, info.Software, info.Version,
 		limitation, info.PaymentsURL, fees)
 	if err != nil {
 		return "", err
