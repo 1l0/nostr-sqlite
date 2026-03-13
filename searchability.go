@@ -4,9 +4,10 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
-	"fmt"
-	"net/url"
 	"strings"
+
+	"fiatjaf.com/nostr"
+	"fiatjaf.com/nostr/nip11"
 )
 
 type User struct {
@@ -20,28 +21,6 @@ type User struct {
 	Lud16     sql.NullString
 	EventID   string
 	CreatedAt int64
-}
-
-// RelayInfo is a superset-friendly representation of NIP-11.
-// Unknown fields should be stored in Raw.
-type RelayInfo struct {
-	Name           *string `json:"name,omitempty"`
-	Description    *string `json:"description,omitempty"`
-	Banner         *string `json:"banner,omitempty"`
-	Icon           *string `json:"icon,omitempty"`
-	PubKey         *string `json:"pubkey,omitempty"`
-	Self           *string `json:"self,omitempty"`
-	Contact        *string `json:"contact,omitempty"`
-	SupportedNIPs  []int   `json:"supported_nips,omitempty"`
-	Software       *string `json:"software,omitempty"`
-	Version        *string `json:"version,omitempty"`
-	TermsOfService *string `json:"terms_of_service,omitempty"`
-
-	Limitation  any     `json:"limitation,omitempty"`
-	PaymentsURL *string `json:"payments_url,omitempty"`
-	Fees        any     `json:"fees,omitempty"`
-
-	Raw json.RawMessage `json:"-"`
 }
 
 type Relay struct {
@@ -64,50 +43,6 @@ type Relay struct {
 	PaymentsURL sql.NullString
 	Fees        []byte
 	Raw         []byte
-}
-
-func CanonicalRelayURL(input string) (string, error) {
-	s := strings.TrimSpace(input)
-	if s == "" {
-		return "", fmt.Errorf("empty relay url")
-	}
-
-	// tolerate inputs without scheme
-	if !strings.Contains(s, "://") {
-		s = "https://" + s
-	}
-
-	u, err := url.Parse(s)
-	if err != nil {
-		return "", err
-	}
-
-	switch strings.ToLower(u.Scheme) {
-	case "ws":
-		u.Scheme = "http"
-	case "wss":
-		u.Scheme = "https"
-	case "http", "https":
-		// keep
-	default:
-		// if unknown, keep but still normalize host casing etc.
-	}
-
-	u.Fragment = ""
-	u.RawQuery = ""
-	u.User = nil
-
-	u.Host = strings.ToLower(u.Host)
-	if strings.HasSuffix(u.Host, ":80") && u.Scheme == "http" {
-		u.Host = strings.TrimSuffix(u.Host, ":80")
-	}
-	if strings.HasSuffix(u.Host, ":443") && u.Scheme == "https" {
-		u.Host = strings.TrimSuffix(u.Host, ":443")
-	}
-
-	u.Path = strings.TrimRight(u.Path, "/")
-
-	return u.String(), nil
 }
 
 func (s *Store) GetUser(ctx context.Context, pubkey string) (*User, error) {
@@ -153,20 +88,9 @@ LIMIT $2`, escapeLike(prefix)+"%", limit)
 	return out, rows.Err()
 }
 
-func (s *Store) UpsertRelayInfo(ctx context.Context, relayURL string, fetchedAt int64, info RelayInfo) (string, error) {
-	canon, err := CanonicalRelayURL(relayURL)
-	if err != nil {
-		return "", err
-	}
-
-	raw := info.Raw
-	if len(raw) == 0 {
-		// best-effort: marshal known fields, allowing extra fields to be lost if not provided in Raw.
-		raw, err = json.Marshal(info)
-		if err != nil {
-			return "", err
-		}
-	}
+func (s *Store) UpsertRelayInfo(ctx context.Context, relayURL string, fetchedAt int64, info nip11.RelayInformationDocument) (string, error) {
+	var err error
+	canon := nostr.NormalizeURL(relayURL)
 
 	var supportedNIPs any
 	if info.SupportedNIPs != nil {
@@ -195,12 +119,12 @@ func (s *Store) UpsertRelayInfo(ctx context.Context, relayURL string, fetchedAt 
 	_, err = s.DB.ExecContext(ctx, `
 INSERT INTO relays (
   url, fetched_at,
-  name, description, banner, icon, pubkey, self, contact, supported_nips, software, version, terms_of_service,
-  limitation, payments_url, fees, raw
+  name, description, banner, icon, pubkey, self, contact, supported_nips, software, version,
+  limitation, payments_url, fees
 ) VALUES (
   $1, $2,
-  $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
-  $14, $15, $16, $17
+  $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 
+  $13, $14, $15
 )
 ON CONFLICT(url) DO UPDATE SET
   fetched_at = excluded.fetched_at,
@@ -214,15 +138,13 @@ ON CONFLICT(url) DO UPDATE SET
   supported_nips = excluded.supported_nips,
   software = excluded.software,
   version = excluded.version,
-  terms_of_service = excluded.terms_of_service,
   limitation = excluded.limitation,
   payments_url = excluded.payments_url,
-  fees = excluded.fees,
-  raw = excluded.raw
+  fees = excluded.fees
 WHERE excluded.fetched_at > relays.fetched_at
 `, canon, fetchedAt,
-		info.Name, info.Description, info.Banner, info.Icon, info.PubKey, info.Self, info.Contact, supportedNIPs, info.Software, info.Version, info.TermsOfService,
-		limitation, info.PaymentsURL, fees, raw)
+		info.Name, info.Description, info.Banner, info.Icon, info.PubKey, info.Self, info.Contact, supportedNIPs, info.Software, info.Version,
+		limitation, info.PaymentsURL, fees)
 	if err != nil {
 		return "", err
 	}
@@ -232,21 +154,18 @@ WHERE excluded.fetched_at > relays.fetched_at
 }
 
 func (s *Store) GetRelay(ctx context.Context, relayURL string) (*Relay, error) {
-	canon, err := CanonicalRelayURL(relayURL)
-	if err != nil {
-		return nil, err
-	}
+	canon := nostr.NormalizeURL(relayURL)
 
 	row := s.DB.QueryRowContext(ctx, `
-SELECT url, fetched_at, name, description, banner, icon, pubkey, self, contact, supported_nips, software, version, terms_of_service,
-       limitation, payments_url, fees, raw
+SELECT url, fetched_at, name, description, banner, icon, pubkey, self, contact, supported_nips, software, version,
+       limitation, payments_url, fees
 FROM relays
 WHERE url = $1`, canon)
 
 	var r Relay
 	if err := row.Scan(
-		&r.URL, &r.FetchedAt, &r.Name, &r.Description, &r.Banner, &r.Icon, &r.PubKey, &r.Self, &r.Contact, &r.SupportedNIPs, &r.Software, &r.Version, &r.TermsOfService,
-		&r.Limitation, &r.PaymentsURL, &r.Fees, &r.Raw,
+		&r.URL, &r.FetchedAt, &r.Name, &r.Description, &r.Banner, &r.Icon, &r.PubKey, &r.Self, &r.Contact, &r.SupportedNIPs, &r.Software, &r.Version,
+		&r.Limitation, &r.PaymentsURL, &r.Fees,
 	); err != nil {
 		if err == sql.ErrNoRows {
 			return nil, nil
@@ -261,8 +180,8 @@ func (s *Store) SearchRelaysByNamePrefix(ctx context.Context, prefix string, lim
 		limit = 50
 	}
 	rows, err := s.DB.QueryContext(ctx, `
-SELECT url, fetched_at, name, description, banner, icon, pubkey, self, contact, supported_nips, software, version, terms_of_service,
-       limitation, payments_url, fees, raw
+SELECT url, fetched_at, name, description, banner, icon, pubkey, self, contact, supported_nips, software, version,
+       limitation, payments_url, fees
 FROM relays
 WHERE name LIKE $1 ESCAPE '\'
 ORDER BY name ASC
@@ -276,8 +195,8 @@ LIMIT $2`, escapeLike(prefix)+"%", limit)
 	for rows.Next() {
 		var r Relay
 		if err := rows.Scan(
-			&r.URL, &r.FetchedAt, &r.Name, &r.Description, &r.Banner, &r.Icon, &r.PubKey, &r.Self, &r.Contact, &r.SupportedNIPs, &r.Software, &r.Version, &r.TermsOfService,
-			&r.Limitation, &r.PaymentsURL, &r.Fees, &r.Raw,
+			&r.URL, &r.FetchedAt, &r.Name, &r.Description, &r.Banner, &r.Icon, &r.PubKey, &r.Self, &r.Contact, &r.SupportedNIPs, &r.Software, &r.Version,
+			&r.Limitation, &r.PaymentsURL, &r.Fees,
 		); err != nil {
 			return nil, err
 		}
@@ -293,4 +212,3 @@ func escapeLike(s string) string {
 	s = strings.ReplaceAll(s, `_`, `\_`)
 	return s
 }
-

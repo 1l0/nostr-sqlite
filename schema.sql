@@ -73,13 +73,10 @@ CREATE TABLE IF NOT EXISTS relays (
     supported_nips JSON,
     software TEXT,
     version TEXT,
-    terms_of_service TEXT,
 
     limitation JSON,
     payments_url TEXT,
-    fees JSON,
-
-    raw JSON NOT NULL
+    fees JSON
 );
 
 CREATE INDEX IF NOT EXISTS relays_name_idx ON relays(name);
