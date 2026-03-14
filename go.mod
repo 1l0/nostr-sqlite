@@ -2,6 +2,8 @@ module github.com/1l0/nostr-sqlite
 
 go 1.25.0
 
+replace fiatjaf.com/nostr => github.com/1l0/nostrlib v0.0.0-20260309112724-8d93f8c49d07
+
 require (
 	fiatjaf.com/nostr v0.0.0-20260312140001-bb4093d834af
 	github.com/mattn/go-sqlite3 v1.14.32
@@ -27,4 +29,5 @@ require (
 	github.com/tidwall/match v1.2.0 // indirect
 	github.com/tidwall/pretty v1.2.1 // indirect
 	golang.org/x/exp v0.0.0-20260312153236-7ab1446f8b90 // indirect
+	marwan.io/wasm-fetch v0.1.0 // indirect
 )
