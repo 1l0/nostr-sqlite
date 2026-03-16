@@ -1,4 +1,4 @@
-module github.com/1l0/nostr-sqlite
+module github.com/nosuta/nostr-sqlite
 
 go 1.25.0
 
