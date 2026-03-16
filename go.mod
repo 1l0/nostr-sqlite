@@ -2,7 +2,7 @@ module github.com/nosuta/nostr-sqlite
 
 go 1.25.0
 
-replace fiatjaf.com/nostr => github.com/1l0/nostrlib v0.0.0-20260309112724-8d93f8c49d07
+replace fiatjaf.com/nostr => github.com/nosuta/nostr v0.1.3
 
 require (
 	fiatjaf.com/nostr v0.0.0-20260312140001-bb4093d834af
@@ -10,7 +10,6 @@ require (
 )
 
 require (
-	fiatjaf.com/lib v0.3.6 // indirect
 	github.com/ImVexed/fasturl v0.0.0-20230304231329-4e41488060f3 // indirect
 	github.com/btcsuite/btcd/btcec/v2 v2.3.6 // indirect
 	github.com/btcsuite/btcd/chaincfg/chainhash v1.1.0 // indirect
