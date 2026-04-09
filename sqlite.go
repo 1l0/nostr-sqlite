@@ -69,10 +69,6 @@ func New(db *sql.DB, opts ...Option) (*Store, error) {
 		return nil, fmt.Errorf("failed to apply base schema: %w", err)
 	}
 
-	if _, err := db.Exec("PRAGMA journal_mode = WAL;"); err != nil {
-		return nil, fmt.Errorf("failed to set WAL mode: %w", err)
-	}
-
 	if _, err := db.Exec("PRAGMA busy_timeout = 1000;"); err != nil {
 		return nil, fmt.Errorf("failed to set busy timeout: %w", err)
 	}

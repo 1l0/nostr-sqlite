@@ -21,6 +21,16 @@ func WithAdditionalSchema(schema string) Option {
 	}
 }
 
+// WithWALMode sets the SQLite PRAGMA journal_mode with WAL.
+func WithWALMode() Option {
+	return func(s *Store) error {
+		if _, err := s.DB.Exec("PRAGMA journal_mode = WAL;"); err != nil {
+			return fmt.Errorf("failed to set WAL mode: %w", err)
+		}
+		return nil
+	}
+}
+
 // WithBusyTimeout sets the SQLite PRAGMA busy_timeout. This allows concurrent
 // operations to retry when the database is locked, up to the specified duration.
 // The duration is internally converted to milliseconds, as required by SQLite.
